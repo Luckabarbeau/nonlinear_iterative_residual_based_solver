@@ -1089,7 +1089,7 @@ def solve_matrix_gmg(x_0,problem,solver_options,enable_preconditionner=True,off_
         
         start_time = time.time()
         # Log the time spend on the update of the solution
-        if(i%1==0 ):
+        if(i%solver_options.frequency_of_residual_direct_evaluation==0 ):
             # Every few iterations, the residual is re-evaluated directly instead of relying on the residual predicted by the GMRES algorithm. This approach enables accurate monitoring of the system's nonlinearity.
             r_exact=residue-Jac@x
             r=r_exact
@@ -1135,8 +1135,10 @@ def solve_jac(x_0,problem,solver_options):
     R_norm_0=R_norm
     if(solver_options.verbosity):
         print("NNL Initial residual = "+str(R_norm_0))
-  
-    prep_options=Preconditionner_option(level=2,alpha=0.0001,iterations_for_smoothing=5,frequency_of_residual_direct_evaluation=1,tol=1e-6,max_iterations=1000,max_krylov_vectors=1000,minimum_mesh_size=8,non_linearity_index_limit=0.5, verbosity=True)
+        
+    print_gmg_gmres_iterations=True
+    #Initialize the iterative solver options
+    prep_options=Preconditionner_option(level=2,alpha=0.0001,iterations_for_smoothing=5,frequency_of_residual_direct_evaluation=100,tol=1e-6,max_iterations=1000,max_krylov_vectors=1000,minimum_mesh_size=8,non_linearity_index_limit=0.5, verbosity=print_gmg_gmres_iterations)
     # Initialized a bunch of timer counter
     time_spent_on_perturbation_residual=0
     time_spent_on_residual=0
@@ -1155,10 +1157,11 @@ def solve_jac(x_0,problem,solver_options):
         start_time = time.time()
         # Solve update using GMRES with GMG preconditionner
         delta_x,r=solve_matrix_gmg(x,problem,prep_options)
-        # Uncomment to solve update using direct solver
+        # Uncomment to solve update using direct solver or gmres without preconditionner 
         # residue=R(x,problem,off_set)
         # Jac=construct_jacobian(x, problem)
-        # delta_x=spsolve(Jac,residue)
+        # delta_x=spsolve(Jac,residue) # Direct solver
+        # delta_x=gmres(Jac,residue) # Direct solver
        
         x-=delta_x
         r=R(x,problem,off_set)
