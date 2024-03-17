@@ -18,6 +18,22 @@ import time
 import sys
 np.set_printoptions(threshold=sys.maxsize)
 def construct_jacobian(x, problem):
+    """
+    Computes the Jacobian for a system of equations characterized by nonlinearity.
+    This function implements the Jacobian  calculation for equations of the form:
+    D * (∇²x) + C + E * exp(F * x) - G * x * ∇ • x = 0,
+    where D, C, E, F, and G are coefficients defining the problem's behavior.
+
+    Parameters:
+    - x (array_like): The current solution vector.
+    - problem (object): An object encapsulating the problem specifics, including dimensions and grid properties.
+
+    Returns:
+    - J (array_like): The computed Jacobian.
+
+    The calculation differentiates between 2D and 3D problems and handles interior and boundary points distinctly,
+    applying the specified equation while taking spatial discretization into account.
+    """
     if(problem.dim==2):
         nx, ny = problem.nx, problem.ny
         N = x.size
@@ -192,7 +208,7 @@ def R(x,problem,off_set=np.zeros(0)):
     """
     Computes the residual for a system of equations characterized by nonlinearity and spatial derivatives.
     This function implements the residual calculation for equations of the form:
-    D * (∇²x) + C + E * exp(F * x) - G * x * ∇*x = 0,
+    D * (∇²x) + C + E * exp(F * x) - G * x * ∇ • x = 0,
     where D, C, E, F, and G are coefficients defining the problem's behavior.
 
     Parameters:
@@ -403,7 +419,7 @@ def trilinear_interpolate(first_grid, nx2, ny2, nz2):
 class Problem():
     """
     A class to model a problem space that can be 2D, or 3D. and solve :
-    D * (∇²x) + C + E * exp(F * x) - G * x * ∇*x = 0,
+    D * (∇²x) + C + E * exp(F * x) - G * x * ∇ • x = 0,
 
     Attributes:
         dim (int): The dimensionality of the problem space (1, 2, or 3).
@@ -498,7 +514,7 @@ class Preconditionner_option():
 
 class Preconditioner_GMG():
     """
-    A class implementing a Geometric Multigrid (GMG) preconditioner. This preconditioner
+    A class implementing a Geometric Multigrid (GMG) preconditioner with a V cycle. This preconditioner
     is designed to efficiently find adequate correction vector arising in discretized partial
     differential equations, especially those that are large and sparse.
     This version of the preconditionner is for nonlinear system of equations
@@ -537,7 +553,7 @@ class Preconditioner_GMG():
             # Check if the current iteration is at the coarsest level
             if i == solver_options.level:
                 # At the coarsest level, we might adjust solver tolerance or other parameters
-                # solver_options.tol = solver_options.tol  # This line appears redundant but may be a placeholder for adjustments
+                # solver_options.tol = solver_options.tol*1e-2  # This line appears redundant but may be a placeholder for adjustments
                 problem.update()  # Ensure problem dimensions and other attributes are up-to-date
                 # Decision branch based on whether the problem size is above a threshold (e.g., nx > 8)
                 if problem.nx > solver_options.minimum_mesh_size*2:
@@ -615,7 +631,7 @@ class Preconditioner_GMG():
 
 class Preconditioner_GMG_Matrix():
     """
-    A class implementing a Geometric Multigrid (GMG) preconditioner. This preconditioner
+    A class implementing a Geometric Multigrid (GMG) preconditioner with a V cycle. This preconditioner
     is designed to efficiently find adequate correction vector arising in discretized partial
     differential equations, especially those that are large and sparse. 
     This version of the preconditionner is for linear system of equations
@@ -654,7 +670,8 @@ class Preconditioner_GMG_Matrix():
             # Check if the current iteration is at the coarsest level
             if i == solver_options.level:
                 # At the coarsest level, we might adjust solver tolerance or other parameters
-                # solver_options.tol = solver_options.tol  # This line appears redundant but may be a placeholder for adjustments
+                # Better performance when sub-grid are solved with higher precision.
+                solver_options.tol = solver_options.tol*1e-2  # This line appears redundant but may be a placeholder for adjustments
                 problem.update()  # Ensure problem dimensions and other attributes are up-to-date
                 # Decision branch based on whether the problem size is above a threshold (e.g., nx > 8)
                 if problem.nx > solver_options.minimum_mesh_size*2:
@@ -787,7 +804,7 @@ def solve(x_0,problem,solver_options,enable_preconditionner=True,off_set=np.zero
     R_norm_0=R_norm
     if(solver_options.verbosity):
         print("Initial residual = "+str(R_norm_0))
-    non_linear_index=0
+    non_linear_index=0 #(NLI) indicate how non linear the solution process is. use to define when to restart the solver.
     previous_d=[]
     previous_dr=[]
     previous_dr_dot_product=[]
@@ -924,7 +941,7 @@ def solve(x_0,problem,solver_options,enable_preconditionner=True,off_set=np.zero
         print("time_spent_on_alphas_matrix_solve= "+str(time_spent_on_alphas_matrix_solve))
         print("time_spent_on_solution_update= "+str(time_spent_on_solution_update))
         total_time_end=time.time()
-        print("total time spent for nx of " +str(problem.nx)+" = "+str(total_time_end-total_time_start))
+        print("total time spent for n= " +str(len(x))+" dofs = "+str(total_time_end-total_time_start))
     return x,R_norm
 
 
@@ -1026,7 +1043,6 @@ def solve_matrix_gmg(x_0,problem,solver_options,enable_preconditionner=True,off_
             previous_d.append(d)
             # Calculate the variation vector
             dr=-Jac@d
-            # reinitalized the non_linear_index
         else:
             # Orthogonalized the correction vector with previous vectors
             for j in range(len(previous_d)):
@@ -1115,7 +1131,7 @@ def solve_matrix_gmg(x_0,problem,solver_options,enable_preconditionner=True,off_
         print("    time_spent_on_solution_update= "+str(time_spent_on_solution_update))
         print("    time_spent_on_matrix_and_residual_evaluation= "+str(time_spent_on_matrix_and_residual_evaluation))
         total_time_end=time.time()
-        print("    total time spent for nx of " +str(problem.nx)+" = "+str(total_time_end-total_time_start))
+        print("    total time spent for n= " +str(len(x))+" dofs = "+str(total_time_end-total_time_start))
     return x,R_norm
     
 
@@ -1133,40 +1149,47 @@ def solve_jac(x_0,problem,solver_options):
     r=R(x_0,problem,off_set)
     R_norm=np.linalg.norm(r)
     R_norm_0=R_norm
+    previous_r_norm=R_norm_0
     if(solver_options.verbosity):
-        print("NNL Initial residual = "+str(R_norm_0))
+        print("NNL Initial residual = "+str(R_norm_0)) # Newton non linear (NNL) initial residual
         
-    print_gmg_gmres_iterations=True
+    print_gmg_gmres_iterations=False
+    gmg_gmres_tol=5e-2 # For Problem 3 use gmg_gmres_tol=1e-6, For Problem 4 use gmg_gmres_tol=5e-2
     #Initialize the iterative solver options
-    prep_options=Preconditionner_option(level=2,alpha=0.0001,iterations_for_smoothing=5,frequency_of_residual_direct_evaluation=100,tol=1e-6,max_iterations=1000,max_krylov_vectors=1000,minimum_mesh_size=8,non_linearity_index_limit=0.5, verbosity=print_gmg_gmres_iterations)
+    options_for_matrix=Preconditionner_option(level=2,alpha=0.0001,iterations_for_smoothing=5,frequency_of_residual_direct_evaluation=100,tol=gmg_gmres_tol,max_iterations=1000,max_krylov_vectors=1000,minimum_mesh_size=8,non_linearity_index_limit=0.5, verbosity=print_gmg_gmres_iterations)
     # Initialized a bunch of timer counter
-    time_spent_on_perturbation_residual=0
     time_spent_on_residual=0
-    time_spent_on_preconditioner=0
-    time_spent_on_alphas_matrix_assembly=0
-    time_spent_on_alphas_matrix_solve=0
-    time_spent_on_solution_update=0
     
     # Set the size of the pertubation vector with alpha and the tolerance
- 
     max_tol=max(1e-12,solver_options.tol*R_norm_0) 
     #Initialized the iteation counter
     i=0
+    
     while R_norm>max_tol and i<solver_options.max_iterations:
         
-        start_time = time.time()
+       
         # Solve update using GMRES with GMG preconditionner
-        delta_x,r=solve_matrix_gmg(x,problem,prep_options)
+        delta_x,r=solve_matrix_gmg(x,problem,options_for_matrix)
         # Uncomment to solve update using direct solver or gmres without preconditionner 
         # residue=R(x,problem,off_set)
         # Jac=construct_jacobian(x, problem)
         # delta_x=spsolve(Jac,residue) # Direct solver
         # delta_x=gmres(Jac,residue) # Direct solver
        
-        x-=delta_x
+        x-=delta_x 
+        start_time = time.time()
         r=R(x,problem,off_set)
         R_norm=np.linalg.norm(r)
-        
+        alpha=1.
+        while(previous_r_norm<R_norm and alpha>0.001953125):
+            x+=delta_x*alpha
+            alpha=alpha*0.5
+            x-=delta_x*alpha
+            
+            r=R(x,problem,off_set)
+            R_norm=np.linalg.norm(r)
+            print("alpha "+str(alpha)+" "+str(R_norm))
+        previous_r_norm= R_norm
         end_time = time.time()
         time_spent_on_residual+=end_time-start_time
 
@@ -1177,37 +1200,62 @@ def solve_jac(x_0,problem,solver_options):
                  
     if(solver_options.verbosity):
         print()      
-        print("time_spent_on_perturbation_residual= "+str(time_spent_on_perturbation_residual))
         print("time_spent_on_residual= "+str(time_spent_on_residual))
-        print("time_spent_on_preconditioner= "+str(time_spent_on_preconditioner))
-        print("time_spent_on_alphas_matrix_assembly= "+str(time_spent_on_alphas_matrix_assembly))
-        print("time_spent_on_alphas_matrix_solve= "+str(time_spent_on_alphas_matrix_solve))
-        print("time_spent_on_solution_update= "+str(time_spent_on_solution_update))
         total_time_end=time.time()
-        print("total time spent for nx of " +str(problem.nx)+" = "+str(total_time_end-total_time_start))
+        print("total time spent for n= " +str(len(x))+" dofs = "+str(total_time_end-total_time_start))
     return x,R_norm
 
 plt.close('all')
- 
-n=50
+
+
+############################################### Run code ################################################# 
 
 #probleme size
-problem=Problem(dim=3,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=10)
+n=100
+# Equation solved D * (∇²x) + C + E * exp(F * x) - G * x  ∇ • x = 0,
+
+# Problem 1
+#problem=Problem(dim=2,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=0) # Solvable with non linear GMG gmres solver not with jacobian non linear solver
+
+# Problem 2
+#problem=Problem(dim=3,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=0) # Solvable with non linear GMG gmres solver not with jacobian non linear solver
+
+# Problem 3
+#problem=Problem(dim=3,nx=n,ny=n,nz=n,C=1,D=1,E=0,F=0,G=0) # Solvable with non linear GMG gmres solver not with jacobian non linear solver
+
+# Problem 4
+problem=Problem(dim=2,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=10)  #Faster with non linear GMG gmres solver then jacobian non linear solver
+
+# Problem 5
+#problem=Problem(dim=3,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=10) #Faster jacobian non linear solver then GMG gmres non linear solver.
+
+# Problem 6
+#problem=Problem(dim=2,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=100) # Solvable with non linear GMG gmres solver not with jacobian non linear solver
+
+# Problem 6
+#problem=Problem(dim=3,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=100) # Solvable with non linear GMG gmres solver not with jacobian non linear solver (barely)
+
+# Setup the solver options see class definition for more details
+options=Preconditionner_option(level=2,alpha=0.0001,iterations_for_smoothing=5,frequency_of_residual_direct_evaluation=1,tol=1e-6,max_iterations=1000,max_krylov_vectors=1000,minimum_mesh_size=4,non_linearity_index_limit=0.5, verbosity=True)
+
+# Initialized x
 x=np.ones(problem.size)*0
-
-# Setup the preconditionner options see class definition for more details
-prep_options=Preconditionner_option(level=2,alpha=0.0001,iterations_for_smoothing=5,frequency_of_residual_direct_evaluation=1,tol=1e-6,max_iterations=1000,max_krylov_vectors=1000,minimum_mesh_size=8,non_linearity_index_limit=0.5, verbosity=True)
-
 # Solve the problem 
-x_1,r=solve(x,problem,prep_options)
+
+# nonlinear GMG_GMRES solver
+x_1,r=solve(x,problem,options)
+
+print("Reset solution and try using Jacobian with gmg gmres matrix solver.")
 x=np.ones(problem.size)*0
-x_2,r=solve_jac(x,problem,prep_options)
+x_2,r=solve_jac(x,problem,options)
 
 x=x_1
-e=x_2-x_1
 
-# Graph solution if n smaller then 100 otherwise graph are to heavy to make 
-if( True):
+e=x_2-x_1
+print("norm of difference between the two methods = "+str(np.linalg.norm(e)))
+
+# Graph solution if n smaller then 100 otherwise graph are to heavy.
+if(len(x)<20000):
     if problem.dim==2:
         fig,ax = plt.subplots()
         fig1,ax1 = plt.subplots()
