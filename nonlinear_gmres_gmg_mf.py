@@ -1154,7 +1154,7 @@ def solve_jac(x_0,problem,solver_options):
         print("NNL Initial residual = "+str(R_norm_0)) # Newton non linear (NNL) initial residual
         
     print_gmg_gmres_iterations=False
-    gmg_gmres_tol=5e-2 # For Problem 3 use gmg_gmres_tol=1e-6, For Problem 4 use gmg_gmres_tol=5e-2
+    gmg_gmres_tol=5e-2 # For Problem 3 use gmg_gmres_tol=1e-6, For Problem 4 and 5 use gmg_gmres_tol=5e-2
     #Initialize the iterative solver options
     options_for_matrix=Preconditionner_option(level=2,alpha=0.0001,iterations_for_smoothing=5,frequency_of_residual_direct_evaluation=100,tol=gmg_gmres_tol,max_iterations=1000,max_krylov_vectors=1000,minimum_mesh_size=8,non_linearity_index_limit=0.5, verbosity=print_gmg_gmres_iterations)
     # Initialized a bunch of timer counter
@@ -1221,19 +1221,19 @@ n=100
 #problem=Problem(dim=3,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=0) # Solvable with non linear GMG gmres solver not with jacobian non linear solver
 
 # Problem 3
-#problem=Problem(dim=3,nx=n,ny=n,nz=n,C=1,D=1,E=0,F=0,G=0) # Solvable with non linear GMG gmres solver not with jacobian non linear solver
+#problem=Problem(dim=3,nx=n,ny=n,nz=n,C=1,D=1,E=0,F=0,G=0) # Solvable with non linear GMG gmres solver not with jacobian non linear solver (Change gmg_gmres_tol to 1e-6 in solve_jac)
 
 # Problem 4
-problem=Problem(dim=2,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=10)  #Faster with non linear GMG gmres solver then jacobian non linear solver
+problem=Problem(dim=2,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=10)  #Faster with non linear GMG gmres solver then jacobian non linear solver (Change gmg_gmres_tol to 5e-2 in solve_jac)
 
 # Problem 5
-#problem=Problem(dim=3,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=10) #Faster jacobian non linear solver then GMG gmres non linear solver.
+#problem=Problem(dim=3,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=10) #Faster jacobian non linear solver then GMG gmres non linear solver. (Change gmg_gmres_tol to 5e-2 in solve_jac)
 
 # Problem 6
-#problem=Problem(dim=2,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=100) # Solvable with non linear GMG gmres solver not with jacobian non linear solver
+#problem=Problem(dim=2,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=100) # Solvable with non linear GMG gmres solver not with jacobian non linear solver (Change gmg_gmres_tol to 5e-2 in solve_jac)
 
 # Problem 6
-#problem=Problem(dim=3,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=100) # Solvable with non linear GMG gmres solver not with jacobian non linear solver (barely)
+#problem=Problem(dim=3,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=100) # Solvable with non linear GMG gmres solver not with jacobian non linear solver (barely) (Change gmg_gmres_tol to 5e-2 in solve_jac)
 
 # Setup the solver options see class definition for more details
 options=Preconditionner_option(level=2,alpha=0.0001,iterations_for_smoothing=5,frequency_of_residual_direct_evaluation=1,tol=1e-6,max_iterations=1000,max_krylov_vectors=1000,minimum_mesh_size=4,non_linearity_index_limit=0.5, verbosity=True)
