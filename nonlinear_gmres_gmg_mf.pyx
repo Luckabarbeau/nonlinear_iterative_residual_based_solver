@@ -14,14 +14,17 @@ from scipy.sparse.linalg import spilu, LinearOperator, gmres, spsolve
 from scipy.sparse import coo_matrix
 import time
 import sys
-from numba import cuda, float64
-import cupy as cp
-
 np.set_printoptions(threshold=sys.maxsize)
-def construct_jacobian(x, problem):
+import numpy as np
+cimport numpy as np
+from numba import cuda
+
+ctypedef np.float64_t DTYPE_t
+
+def construct_jacobian(np.ndarray[DTYPE_t, ndim=1] x, object problem):
     """
     Computes the Jacobian for a system of equations characterized by nonlinearity.
-    This function implements the Jacobian  calculation for equations of the form:
+    This function implements the Jacobian calculation for equations of the form:
     D * (∇²x) + C + E * exp(F * x) - G * x * ∇ • x = 0,
     where D, C, E, F, and G are coefficients defining the problem's behavior.
 
@@ -31,43 +34,48 @@ def construct_jacobian(x, problem):
 
     Returns:
     - J (array_like): The computed Jacobian.
-
-    The calculation differentiates between 2D and 3D problems and handles interior and boundary points distinctly,
-    applying the specified equation while taking spatial discretization into account.
     """
-    if(problem.dim==2):
+    cdef int nx, ny, nz, N, boundary_size
+    cdef int[:] interior_indices, boundary_indices, left, right, up, down, front, back
+    cdef np.ndarray[DTYPE_t, ndim=1] rows_i, cols_i, data_i, data_b, rows_b, cols_b
+    cdef np.ndarray[DTYPE_t, ndim=1] rows, cols, data
+    cdef DTYPE_t dx, dy, dz, dx_inv, dy_inv, dz_inv, dx2, dy2, dz2
+    cdef DTYPE_t D, E, F, G
+
+    if problem.dim == 2:
         nx, ny = problem.nx, problem.ny
         N = x.size
         dx = (1.0 - 0) / (nx - 1)
         dy = (1.0 - 0) / (ny - 1)
         dx_inv = 1.0 / dx
         dy_inv = 1.0 / dy
-        dx2 = dx**2
-        dy2 = dy**2
+        dx2 = dx ** 2
+        dy2 = dy ** 2
         D = problem.D
         E = problem.E
         F = problem.F
         G = problem.G
-    
+
+        # Create interior and boundary masks
         indices = np.arange(N)
         interior_mask = (indices % ny != 0) & (indices % ny != ny - 1) & (indices >= ny) & (indices < N - ny)
-        interior_indices = indices[interior_mask]
+        interior_indices = np.where(interior_mask)[0]
         boundary_indices = np.where(~interior_mask)[0]
-    
+
         # Initialize arrays for interior points
         rows_i = np.repeat(interior_indices, 5)
         cols_i = np.empty_like(rows_i)
         data_i = np.empty_like(rows_i, dtype=np.float64)
-    
+
         # Set up the Laplacian contributions for interior points
         data_i[0::5] = (-2 * D / dx2 - 2 * D / dy2) + E * F * np.exp(F * x[interior_indices])
         cols_i[0::5] = interior_indices  # Self
-    
+
         left = interior_indices - 1
         right = interior_indices + 1
         up = interior_indices - ny
         down = interior_indices + ny
-    
+
         cols_i[1::5] = left
         data_i[1::5] = D / dx2  # Left neighbor
         cols_i[2::5] = right
@@ -76,41 +84,26 @@ def construct_jacobian(x, problem):
         data_i[3::5] = D / dy2  # Up neighbor
         cols_i[4::5] = down
         data_i[4::5] = D / dy2  # Down neighbor
-    
+
         # Adding gradient contributions to the diagonal
-        # Now handle indirect effects due to the gradient term
-        data_i[0::5] += -G * (-0.5 * dx_inv*x[left] + 0.5 * dx_inv* x[right] + 0.5 * dy_inv* x[up] - 0.5 * dy_inv* x[down])
-        # Left neighbor contribution to gradient at x_i
-        data_i[1::5] += -G * (-0.5 * dx_inv) * x[interior_mask]
-        # Right neighbor contribution to gradient at x_i
-        data_i[2::5] += -G * (0.5 * dx_inv) * x[interior_mask]
-        # Up neighbor contribution to gradient at x_i
-        data_i[3::5] += -G * (0.5 * dy_inv) * x[interior_mask]
-        # Down neighbor contribution to gradient at x_i
-        data_i[4::5] += -G * (-0.5 * dy_inv) * x[interior_mask]
-    
+        data_i[0::5] += -G * (-0.5 * dx_inv * x[left] + 0.5 * dx_inv * x[right] + 0.5 * dy_inv * x[up] - 0.5 * dy_inv * x[down])
+        data_i[1::5] += -G * (-0.5 * dx_inv) * x[interior_indices]
+        data_i[2::5] += -G * (0.5 * dx_inv) * x[interior_indices]
+        data_i[3::5] += -G * (0.5 * dy_inv) * x[interior_indices]
+        data_i[4::5] += -G * (-0.5 * dy_inv) * x[interior_indices]
+
         # Handle boundary conditions (Dirichlet example)
+        boundary_size = boundary_indices.shape[0]
         rows_b = boundary_indices
         cols_b = boundary_indices
-        data_b = np.ones(len(boundary_indices))*-1.0  # Assuming boundary condition is x=0 on the boundary
-        
-        
-    
+        data_b = np.ones(boundary_size, dtype=np.float64) * -1.0  # Assuming boundary condition is x=0 on the boundary
+
         # Combine interior and boundary entries
         rows = np.concatenate([rows_i, rows_b])
         cols = np.concatenate([cols_i, cols_b])
         data = np.concatenate([data_i, data_b])
-        
-        sort_indices = np.lexsort((cols, rows))
-        rows_sorted = rows[sort_indices]
-        cols_sorted = cols[sort_indices]
-        data_sorted = data[sort_indices]
-    
-        # Create the sparse Jacobian matrix in COO format
-        J = coo_matrix((data_sorted, (rows_sorted, cols_sorted)), shape=(N, N))
-    
-        return J.tocsr()
-    if(problem.dim==3):
+
+    elif problem.dim == 3:
         nx, ny, nz = problem.nx, problem.ny, problem.nz
         N = x.size
         dx = (1.0 - 0) / (nx - 1)
@@ -118,41 +111,42 @@ def construct_jacobian(x, problem):
         dz = (1.0 - 0) / (nz - 1)
         dx_inv = 1.0 / dx
         dy_inv = 1.0 / dy
-        dz_inv = 1.0 / dy
-        dx2 = dx**2
-        dy2 = dy**2
-        dz2 = dz**2
+        dz_inv = 1.0 / dz
+        dx2 = dx ** 2
+        dy2 = dy ** 2
+        dz2 = dz ** 2
         D = problem.D
         E = problem.E
         F = problem.F
         G = problem.G
-    
+
+        # Create interior and boundary masks
         indices = np.arange(N)
-        interior_mask = (indices-(indices-indices%(problem.nx*problem.ny))>problem.ny) & \
-                        (indices-(indices-indices%(problem.nx*problem.ny))<problem.nx*(problem.ny-1)) & \
+        interior_mask = (indices - (indices - indices % (problem.nx * problem.ny)) > problem.ny) & \
+                        (indices - (indices - indices % (problem.nx * problem.ny)) < problem.nx * (problem.ny - 1)) & \
                         (indices % problem.ny != 0) & \
-                        (indices % problem.ny != problem.ny - 1)  & \
-                        (indices>=(problem.nx*problem.ny))  & \
-                        (indices<=(problem.nz-1)*(problem.ny*problem.nx))
-        interior_indices = indices[interior_mask]
+                        (indices % problem.ny != problem.ny - 1) & \
+                        (indices >= (problem.nx * problem.ny)) & \
+                        (indices <= (problem.nz - 1) * (problem.ny * problem.nx))
+        interior_indices = np.where(interior_mask)[0]
         boundary_indices = np.where(~interior_mask)[0]
-    
+
         # Initialize arrays for interior points
         rows_i = np.repeat(interior_indices, 7)
         cols_i = np.empty_like(rows_i)
         data_i = np.empty_like(rows_i, dtype=np.float64)
-    
+
         # Set up the Laplacian contributions for interior points
         data_i[0::7] = (-2 * D / dx2 - 2 * D / dy2 - 2 * D / dz2) + E * F * np.exp(F * x[interior_indices])
         cols_i[0::7] = interior_indices  # Self
-    
-        left =interior_indices - problem.ny
+
+        left = interior_indices - problem.ny
         right = interior_indices + problem.ny
         up = interior_indices - 1
         down = interior_indices + 1
-        front = interior_indices - problem.nx*problem.ny
-        back = interior_indices + problem.nx*problem.ny
-    
+        front = interior_indices - problem.nx * problem.ny
+        back = interior_indices + problem.nx * problem.ny
+
         cols_i[1::7] = left
         data_i[1::7] = D / dx2  # Left neighbor
         cols_i[2::7] = right
@@ -162,51 +156,45 @@ def construct_jacobian(x, problem):
         cols_i[4::7] = down
         data_i[4::7] = D / dy2  # Down neighbor
         cols_i[5::7] = back
-        data_i[5::7] = D / dy2  # Down neighbor
+        data_i[5::7] = D / dz2  # Back neighbor
         cols_i[6::7] = front
-        data_i[6::7] = D / dy2  # Down neighbor
-    
+        data_i[6::7] = D / dz2  # Front neighbor
+
         # Adding gradient contributions to the diagonal
-        # Now handle indirect effects due to the gradient term
-        data_i[0::7] += -G * (-0.5 * dx_inv*x[left] + 0.5 * dx_inv* x[right] + 0.5 * dy_inv* x[up] - 0.5 * dy_inv* x[down] + 0.5 * dy_inv* x[front] - 0.5 * dy_inv* x[back] )
-        # Left neighbor contribution to gradient at x_i
-        data_i[1::7] += -G * (-0.5 * dx_inv) * x[interior_mask]
-        # Right neighbor contribution to gradient at x_i
-        data_i[2::7] += -G * (0.5 * dx_inv) * x[interior_mask]
-        # Up neighbor contribution to gradient at x_i
-        data_i[3::7] += -G * (0.5 * dy_inv) * x[interior_mask]
-        # Down neighbor contribution to gradient at x_i
-        data_i[4::7] += -G * (-0.5 * dy_inv) * x[interior_mask]
-        # Back neighbor contribution to gradient at x_i
-        data_i[5::7] += -G * (-0.5 * dz_inv) * x[interior_mask]
-        # Front neighbor contribution to gradient at x_i
-        data_i[6::7] += -G * (0.5 * dz_inv) * x[interior_mask]
-    
+        data_i[0::7] += -G * (-0.5 * dx_inv * x[left] + 0.5 * dx_inv * x[right] +
+                              0.5 * dy_inv * x[up] - 0.5 * dy_inv * x[down] +
+                              0.5 * dz_inv * x[front] - 0.5 * dz_inv * x[back])
+        data_i[1::7] += -G * (-0.5 * dx_inv) * x[interior_indices]
+        data_i[2::7] += -G * (0.5 * dx_inv) * x[interior_indices]
+        data_i[3::7] += -G * (0.5 * dy_inv) * x[interior_indices]
+        data_i[4::7] += -G * (-0.5 * dy_inv) * x[interior_indices]
+        data_i[5::7] += -G * (-0.5 * dz_inv) * x[interior_indices]
+        data_i[6::7] += -G * (0.5 * dz_inv) * x[interior_indices]
+
         # Handle boundary conditions (Dirichlet example)
+        boundary_size = boundary_indices.shape[0]
         rows_b = boundary_indices
         cols_b = boundary_indices
-        data_b = np.ones(len(boundary_indices))*-1.0  # Assuming boundary condition is x=0 on the boundary
-        
-        
-    
+        data_b = np.ones(boundary_size, dtype=np.float64) * -1.0  # Assuming boundary condition is x=0 on the boundary
+
         # Combine interior and boundary entries
         rows = np.concatenate([rows_i, rows_b])
         cols = np.concatenate([cols_i, cols_b])
         data = np.concatenate([data_i, data_b])
-        
-        sort_indices = np.lexsort((cols, rows))
-        rows_sorted = rows[sort_indices]
-        cols_sorted = cols[sort_indices]
-        data_sorted = data[sort_indices]
-    
-        # Create the sparse Jacobian matrix in COO format
-        J = coo_matrix((data_sorted, (rows_sorted, cols_sorted)), shape=(N, N))
-    
-        return J.tocsr()
+
+    # Sort the entries and create the sparse Jacobian matrix
+    sort_indices = np.lexsort((cols, rows))
+    rows_sorted = rows[sort_indices]
+    cols_sorted = cols[sort_indices]
+    data_sorted = data[sort_indices]
+
+    # Create the sparse Jacobian matrix in COO format
+    J = coo_matrix((data_sorted, (rows_sorted, cols_sorted)), shape=(N, N))
+
+    return J.tocsr()
 
 
-@cuda.jit
-def compute_residual_2d(x, r, D, exp_coef, const_coef, exp_variable_coef, u_div_u_coef, nx, ny, dx, dy, dx2, dy2):
+def compute_residual_2d(x, r, D, exp_coef, const_coef, exp_variable_coef, u_div_u_coef, nx, ny, dx2, dy2):
     i, j = cuda.grid(2)
     if i > 0 and i < nx - 1 and j > 0 and j < ny - 1:
         idx = j + i * ny
@@ -224,7 +212,7 @@ def compute_residual_2d(x, r, D, exp_coef, const_coef, exp_variable_coef, u_div_
                                            0.5 * x[up] / dy - 0.5 * x[down] / dy))
 
 @cuda.jit
-def compute_residual_3d(x, r, D, exp_coef, const_coef, exp_variable_coef, u_div_u_coef, nx, ny, nz, dx, dy, dz, dx2, dy2, dz2):
+def compute_residual_3d(x, r, D, exp_coef, const_coef, exp_variable_coef, u_div_u_coef, nx, ny, nz, dx2, dy2, dz2):
     i, j, k = cuda.grid(3)
     if i > 0 and i < nx - 1 and j > 0 and j < ny - 1 and k > 0 and k < nz - 1:
         idx = k + j * nz + i * ny * nz
@@ -245,455 +233,200 @@ def compute_residual_3d(x, r, D, exp_coef, const_coef, exp_variable_coef, u_div_
                                            0.5 * x[up] / dy - 0.5 * x[down] / dy +
                                            0.5 * x[back] / dz - 0.5 * x[front] / dz))
 
-
 def R(x, problem, offset=None):
-    if len(x)<1024:
-        """
-        Computes the residual for a system of equations characterized by nonlinearity and spatial derivatives.
-        This function implements the residual calculation for equations of the form:
-        D * (∇²x) + C + E * exp(F * x) - G * x * ∇ • x = 0,
-        where D, C, E, F, and G are coefficients defining the problem's behavior.
+    if offset is None:
+        offset = np.zeros_like(x)
     
-        Parameters:
-        - x (array_like): The current solution vector.
-        - problem (object): An object encapsulating the problem specifics, including dimensions and grid properties.
-        - off_set (array_like, optional): An offset vector to adjust the calculations. Defaults to an empty numpy array.
-    
-        Returns:
-        - r (array_like): The computed residual vector.
-    
-        The calculation differentiates between 2D and 3D problems and handles interior and boundary points distinctly,
-        applying the specified equation while taking spatial discretization into account.
-        """
-        D=problem.D
-        exp_coef=problem.E# really non linear 3.30
-        const_coef=problem.C
-        exp_variable_coef=problem.F
-        u_div_u_coef=problem.G
-    
-        if len(offset) == 0:
-            offset = np.zeros(len(x))
-        if(problem.dim==2):
-            # Initialize the result array
-            r = np.zeros_like(x)
-        
-            # Compute grid spacings
-            dx = (1 - 0) / (problem.nx - 1)
-            dy = (1 - 0) / (problem.ny - 1) if problem.dim > 1 else 0
-            
-        
-            # Pre-compute common factors
-            dx2 = dx ** 2
-            dy2 = dy ** 2
-        
-            # Indices for all points
-            indices = np.arange(x.size)
-            
-            # Exclude boundary points for now by focusing on interior points
-            # Adjust these conditions based on your problem's boundary definitions
-            interior_mask = (indices % problem.ny != 0) & \
-                            (indices % problem.ny != problem.ny - 1) & \
-                            (indices >= problem.ny) & \
-                            (indices < x.size - problem.ny)
-            
-            boundary_mask = ~interior_mask
-            r[boundary_mask] = (0.0-x[boundary_mask])     
-                        
-            # Compute indices for neighbors
-            left = indices[interior_mask] - problem.ny
-            right = indices[interior_mask] + problem.ny
-            up = indices[interior_mask] - 1
-            down = indices[interior_mask] + 1
-        
-            # Apply the equation for interior points
-            r[interior_mask] = D * (-2*x[interior_mask]/dx2-2*x[interior_mask]/dy2 + x[left]/dx2+ x[right]/dx2 + x[up]/dy2 + x[down]/dy2)+const_coef+exp_coef*np.exp(exp_variable_coef*x[interior_mask])\
-                - u_div_u_coef*x[interior_mask]*(-0.5*x[left]/dx+ 0.5*x[right]/dx + 0.5*x[up]/dy - 0.5*x[down]/dy)
-    
-            # Handle boundary points separately, if necessary
-        if(problem.dim==3):
-            # Initialize the result array
-            r = np.zeros_like(x)
-        
-            # Compute grid spacings
-            dx = (1 - 0) / (problem.nx - 1)
-            dy = (1 - 0) / (problem.ny - 1)
-            dz = (1 - 0) / (problem.nz - 1)
-        
-            # Pre-compute common factors
-            dx2 = dx ** 2
-            dy2 = dy ** 2
-            dz2 = dz ** 2
-        
-            # Indices for all points
-            indices = np.arange(x.size)
-    
-            interior_mask = (indices-(indices-indices%(problem.nx*problem.ny))>problem.ny) & \
-                            (indices-(indices-indices%(problem.nx*problem.ny))<problem.nx*(problem.ny-1)) & \
-                            (indices % problem.ny != 0) & \
-                            (indices % problem.ny != problem.ny - 1)  & \
-                            (indices>=(problem.nx*problem.ny))  & \
-                            (indices<=(problem.nz-1)*(problem.ny*problem.nx))
-                           
-            # Exclude boundary points for now by focusing on interior points
-            # Adjust these conditions based on your problem's boundary definitions
-            boundary_mask = ~interior_mask
-            r[boundary_mask] = (0.0-x[boundary_mask])               
-            # Compute indices for neighbors
-            left = indices[interior_mask] - problem.ny
-            right = indices[interior_mask] + problem.ny
-            up = indices[interior_mask] - 1
-            down = indices[interior_mask] + 1
-            front = indices[interior_mask] - problem.nx*problem.ny
-            back = indices[interior_mask] + problem.nx*problem.ny
-            
-            # Apply the equation for interior points
-            r[interior_mask] = D * (-2*x[interior_mask]/dx2-2*x[interior_mask]/dy2-2*x[interior_mask]/dz2 + x[left]/dx2+ x[right]/dx2 + x[up]/dy2 + x[down]/dy2 + x[front]/dz2 + x[back]/dz2)+const_coef+exp_coef*np.exp(exp_variable_coef*x[interior_mask])\
-                -u_div_u_coef*x[interior_mask]*(-0.5*x[left]/dx+ 0.5*x[right]/dx + 0.5*x[up]/dy - 0.5*x[down]/dy+  0.5*x[back]/dz - 0.5*x[front]/dz)
-        
-            # Handle boundary points separately, if necessary
-        return r- offset
-    else:
-        if offset is None:
-            offset = np.zeros_like(x)
-        
-        D = problem.D
-        exp_coef = problem.E
-        const_coef = problem.C
-        exp_variable_coef = problem.F
-        u_div_u_coef = problem.G
-    
-        r = np.zeros_like(x)
-        
-        if problem.dim == 2:
-            nx, ny = problem.nx, problem.ny
-            dx = (1.0 - 0) / (nx - 1)
-            dy = (1.0 - 0) / (ny - 1)
-            dx2 = dx ** 2
-            dy2 = dy ** 2
-    
-            # Define grid dimensions
-            threads_per_block = (16, 16)
-            blocks_per_grid_x = (nx + threads_per_block[0] - 1) // threads_per_block[0]
-            blocks_per_grid_y = (ny + threads_per_block[1] - 1) // threads_per_block[1]
-            blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y)
-    
-            # Transfer data to GPU
-            x_device = cuda.to_device(x)
-            r_device = cuda.to_device(r)
-    
-            # Launch kernel
-            compute_residual_2d[blocks_per_grid, threads_per_block](x_device, r_device, D, exp_coef, const_coef,
-                                                                    exp_variable_coef, u_div_u_coef, nx, ny, dx, dy, dx2, dy2)
-    
-            # Copy result back to CPU
-            r = r_device.copy_to_host()
-            
-        elif problem.dim == 3:
-            nx, ny, nz = problem.nx, problem.ny, problem.nz
-            dx = (1.0 - 0) / (nx - 1)
-            dy = (1.0 - 0) / (ny - 1)
-            dz = (1.0 - 0) / (nz - 1)
-            dx2 = dx ** 2
-            dy2 = dy ** 2
-            dz2 = dz ** 2
-    
-            # Define grid dimensions
-            threads_per_block = (8, 8, 8)
-            blocks_per_grid_x = (nx + threads_per_block[0] - 1) // threads_per_block[0]
-            blocks_per_grid_y = (ny + threads_per_block[1] - 1) // threads_per_block[1]
-            blocks_per_grid_z = (nz + threads_per_block[2] - 1) // threads_per_block[2]
-            blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y, blocks_per_grid_z)
-    
-            # Transfer data to GPU
-            x_device = cuda.to_device(x)
-            r_device = cuda.to_device(r)
-    
-            # Launch kernel
-            compute_residual_3d[blocks_per_grid, threads_per_block](x_device, r_device, D, exp_coef, const_coef,
-                                                                    exp_variable_coef, u_div_u_coef, nx, ny, nz, dx, dy, dz, dx2, dy2, dz2)
-    
-            # Copy result back to CPU
-            r = r_device.copy_to_host()
-        
-        return r - offset
+    D = problem.D
+    exp_coef = problem.E
+    const_coef = problem.C
+    exp_variable_coef = problem.F
+    u_div_u_coef = problem.G
 
-
-# def R(x,problem,off_set=np.zeros(0)):
-#     """
-#     Computes the residual for a system of equations characterized by nonlinearity and spatial derivatives.
-#     This function implements the residual calculation for equations of the form:
-#     D * (∇²x) + C + E * exp(F * x) - G * x * ∇ • x = 0,
-#     where D, C, E, F, and G are coefficients defining the problem's behavior.
-
-#     Parameters:
-#     - x (array_like): The current solution vector.
-#     - problem (object): An object encapsulating the problem specifics, including dimensions and grid properties.
-#     - off_set (array_like, optional): An offset vector to adjust the calculations. Defaults to an empty numpy array.
-
-#     Returns:
-#     - r (array_like): The computed residual vector.
-
-#     The calculation differentiates between 2D and 3D problems and handles interior and boundary points distinctly,
-#     applying the specified equation while taking spatial discretization into account.
-#     """
-#     D=problem.D
-#     exp_coef=problem.E# really non linear 3.30
-#     const_coef=problem.C
-#     exp_variable_coef=problem.F
-#     u_div_u_coef=problem.G
-
-#     if len(off_set) == 0:
-#         off_set = np.zeros(len(x))
-#     if(problem.dim==2):
-#         # Initialize the result array
-#         r = np.zeros_like(x)
+    r = np.zeros_like(x)
     
-#         # Compute grid spacings
-#         dx = (1 - 0) / (problem.nx - 1)
-#         dy = (1 - 0) / (problem.ny - 1) if problem.dim > 1 else 0
-        
-    
-#         # Pre-compute common factors
-#         dx2 = dx ** 2
-#         dy2 = dy ** 2
-    
-#         # Indices for all points
-#         indices = np.arange(x.size)
-        
-#         # Exclude boundary points for now by focusing on interior points
-#         # Adjust these conditions based on your problem's boundary definitions
-#         interior_mask = (indices % problem.ny != 0) & \
-#                         (indices % problem.ny != problem.ny - 1) & \
-#                         (indices >= problem.ny) & \
-#                         (indices < x.size - problem.ny)
-        
-#         boundary_mask = ~interior_mask
-#         r[boundary_mask] = (0.0-x[boundary_mask])     
-                    
-#         # Compute indices for neighbors
-#         left = indices[interior_mask] - problem.ny
-#         right = indices[interior_mask] + problem.ny
-#         up = indices[interior_mask] - 1
-#         down = indices[interior_mask] + 1
-    
-#         # Apply the equation for interior points
-#         r[interior_mask] = D * (-2*x[interior_mask]/dx2-2*x[interior_mask]/dy2 + x[left]/dx2+ x[right]/dx2 + x[up]/dy2 + x[down]/dy2)+const_coef+exp_coef*np.exp(exp_variable_coef*x[interior_mask])\
-#             - u_div_u_coef*x[interior_mask]*(-0.5*x[left]/dx+ 0.5*x[right]/dx + 0.5*x[up]/dy - 0.5*x[down]/dy)
+    if problem.dim == 2:
+        nx, ny = problem.nx, problem.ny
+        dx = (1.0 - 0) / (nx - 1)
+        dy = (1.0 - 0) / (ny - 1)
+        dx2 = dx ** 2
+        dy2 = dy ** 2
 
-#         # Handle boundary points separately, if necessary
-#     if(problem.dim==3):
-#         # Initialize the result array
-#         r = np.zeros_like(x)
-    
-#         # Compute grid spacings
-#         dx = (1 - 0) / (problem.nx - 1)
-#         dy = (1 - 0) / (problem.ny - 1)
-#         dz = (1 - 0) / (problem.nz - 1)
-    
-#         # Pre-compute common factors
-#         dx2 = dx ** 2
-#         dy2 = dy ** 2
-#         dz2 = dz ** 2
-    
-#         # Indices for all points
-#         indices = np.arange(x.size)
-
-#         interior_mask = (indices-(indices-indices%(problem.nx*problem.ny))>problem.ny) & \
-#                         (indices-(indices-indices%(problem.nx*problem.ny))<problem.nx*(problem.ny-1)) & \
-#                         (indices % problem.ny != 0) & \
-#                         (indices % problem.ny != problem.ny - 1)  & \
-#                         (indices>=(problem.nx*problem.ny))  & \
-#                         (indices<=(problem.nz-1)*(problem.ny*problem.nx))
-                       
-#         # Exclude boundary points for now by focusing on interior points
-#         # Adjust these conditions based on your problem's boundary definitions
-#         boundary_mask = ~interior_mask
-#         r[boundary_mask] = (0.0-x[boundary_mask])               
-#         # Compute indices for neighbors
-#         left = indices[interior_mask] - problem.ny
-#         right = indices[interior_mask] + problem.ny
-#         up = indices[interior_mask] - 1
-#         down = indices[interior_mask] + 1
-#         front = indices[interior_mask] - problem.nx*problem.ny
-#         back = indices[interior_mask] + problem.nx*problem.ny
-        
-#         # Apply the equation for interior points
-#         r[interior_mask] = D * (-2*x[interior_mask]/dx2-2*x[interior_mask]/dy2-2*x[interior_mask]/dz2 + x[left]/dx2+ x[right]/dx2 + x[up]/dy2 + x[down]/dy2 + x[front]/dz2 + x[back]/dz2)+const_coef+exp_coef*np.exp(exp_variable_coef*x[interior_mask])\
-#             -u_div_u_coef*x[interior_mask]*(-0.5*x[left]/dx+ 0.5*x[right]/dx + 0.5*x[up]/dy - 0.5*x[down]/dy+  0.5*x[back]/dz - 0.5*x[front]/dz)
-    
-#         # Handle boundary points separately, if necessary
-#     return r- off_set
-
-@cuda.jit
-def gpu_bilinear_interpolate(first_grid, x0, x1, y0, y1, wx, wy, second_grid):
-    i, j = cuda.grid(2)
-
-    if i < second_grid.shape[0] and j < second_grid.shape[1]:
-        # Perform interpolation
-        top_left = first_grid[y0[i], x0[j]]
-        top_right = first_grid[y0[i], x1[j]]
-        bottom_left = first_grid[y1[i], x0[j]]
-        bottom_right = first_grid[y1[i], x1[j]]
-
-        second_grid[i, j] = (top_left * (1 - wx[j]) * (1 - wy[i]) +
-                             top_right * wx[j] * (1 - wy[i]) +
-                             bottom_left * (1 - wx[j]) * wy[i] +
-                             bottom_right * wx[j] * wy[i])
-
-def bilinear_interpolate(first_grid, nx2, ny2):
-    ny, nx = first_grid.shape
-
-    # Generate grid for destination coordinates
-    x = np.linspace(0, nx - 1, nx2)
-    y = np.linspace(0, ny - 1, ny2)
-
-    # Calculate the coordinates of the four neighbors
-    x0 = np.floor(x).astype(int)
-    x1 = np.clip(x0 + 1, 0, nx - 1)
-    y0 = np.floor(y).astype(int)
-    y1 = np.clip(y0 + 1, 0, ny - 1)
-
-    # Calculate interpolation weights
-    wx = x - x0
-    wy = y - y0
-
-    # If the grid size is large, use GPU; otherwise, use CPU
-    if nx2 * ny2 > 2048:
-        # Allocate memory for result on GPU
-        second_grid_gpu = cuda.device_array((ny2, nx2), dtype=np.float64)
-
-        # Launch kernel
+        # Define grid dimensions
         threads_per_block = (16, 16)
-        blocks_per_grid_x = (nx2 + threads_per_block[1] - 1) // threads_per_block[1]
-        blocks_per_grid_y = (ny2 + threads_per_block[0] - 1) // threads_per_block[0]
+        blocks_per_grid_x = (nx + threads_per_block[0] - 1) // threads_per_block[0]
+        blocks_per_grid_y = (ny + threads_per_block[1] - 1) // threads_per_block[1]
         blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y)
 
-        gpu_bilinear_interpolate[blocks_per_grid, threads_per_block](
-            cuda.to_device(first_grid), cuda.to_device(x0), cuda.to_device(x1),
-            cuda.to_device(y0), cuda.to_device(y1), cuda.to_device(wx),
-            cuda.to_device(wy), second_grid_gpu
-        )
+        # Transfer data to GPU
+        x_device = cuda.to_device(x)
+        r_device = cuda.to_device(r)
 
-        # Copy result back to host
-        second_grid = second_grid_gpu.copy_to_host()
-    else:
-        # CPU-based interpolation
-        # Reshape for broadcasting
-        wx = wx.reshape(1, -1)
-        wy = wy.reshape(-1, 1)
+        # Launch kernel
+        compute_residual_2d[blocks_per_grid, threads_per_block](x_device, r_device, D, exp_coef, const_coef,
+                                                                exp_variable_coef, u_div_u_coef, nx, ny, dx2, dy2)
 
-        # Get values from the four neighbors
-        top_left = first_grid[y0, :][:, x0]
-        top_right = first_grid[y0, :][:, x1]
-        bottom_left = first_grid[y1, :][:, x0]
-        bottom_right = first_grid[y1, :][:, x1]
+        # Copy result back to CPU
+        r = r_device.copy_to_host()
+        
+    elif problem.dim == 3:
+        nx, ny, nz = problem.nx, problem.ny, problem.nz
+        dx = (1.0 - 0) / (nx - 1)
+        dy = (1.0 - 0) / (ny - 1)
+        dz = (1.0 - 0) / (nz - 1)
+        dx2 = dx ** 2
+        dy2 = dy ** 2
+        dz2 = dz ** 2
 
-        # Perform interpolation
-        second_grid = (top_left * (1 - wx) * (1 - wy) +
-                       top_right * wx * (1 - wy) +
-                       bottom_left * (1 - wx) * wy +
-                       bottom_right * wx * wy)
+        # Define grid dimensions
+        threads_per_block = (8, 8, 8)
+        blocks_per_grid_x = (nx + threads_per_block[0] - 1) // threads_per_block[0]
+        blocks_per_grid_y = (ny + threads_per_block[1] - 1) // threads_per_block[1]
+        blocks_per_grid_z = (nz + threads_per_block[2] - 1) // threads_per_block[2]
+        blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y, blocks_per_grid_z)
+
+        # Transfer data to GPU
+        x_device = cuda.to_device(x)
+        r_device = cuda.to_device(r)
+
+        # Launch kernel
+        compute_residual_3d[blocks_per_grid, threads_per_block](x_device, r_device, D, exp_coef, const_coef,
+                                                                exp_variable_coef, u_div_u_coef, nx, ny, nz, dx2, dy2, dz2)
+
+        # Copy result back to CPU
+        r = r_device.copy_to_host()
+    
+    return r - offset
+
+def bilinear_interpolate(np.ndarray[DTYPE_t, ndim=2] first_grid, int nx2, int ny2):
+    """
+    Performs bilinear interpolation on a 2D coarse grid to create a finer grid with specified dimensions.
+
+    Parameters:
+    - first_grid (2D array_like): The 2D array representing the coarse grid.
+    - nx2, ny2 (int): The dimensions of the desired finer grid.
+
+    Returns:
+    - second_grid (2D array_like): The interpolated 2D array representing the finer grid.
+    
+    The function calculates the values of the finer grid by interpolating the values from the nearest four neighbors
+    in the coarse grid for each point in the finer grid.
+    """
+    # Declare the original dimensions explicitly as integers
+    cdef int nx = first_grid.shape[1]
+    cdef int ny = first_grid.shape[0]
+
+    cdef int i, j
+    cdef int x0_idx, y0_idx, x1_idx, y1_idx
+    cdef double x_weight, y_weight
+    cdef double top_left, top_right, bottom_left, bottom_right
+
+    # Create empty finer grid
+    cdef np.ndarray[DTYPE_t, ndim=2] second_grid = np.zeros((ny2, nx2), dtype=np.float64)
+
+    # Calculate scaling factors
+    cdef double x_scale = (nx - 1) / (nx2 - 1)
+    cdef double y_scale = (ny - 1) / (ny2 - 1)
+
+    # Perform bilinear interpolation
+    for i in range(ny2):
+        for j in range(nx2):
+            # Find the coordinates of the four neighbors
+            x0_idx = int(np.floor(j * x_scale))
+            y0_idx = int(np.floor(i * y_scale))
+
+            x1_idx = min(x0_idx + 1, nx - 1)
+            y1_idx = min(y0_idx + 1, ny - 1)
+
+            # Calculate interpolation weights
+            x_weight = (j * x_scale) - x0_idx
+            y_weight = (i * y_scale) - y0_idx
+
+            # Retrieve values at the four neighboring points
+            top_left = first_grid[y0_idx, x0_idx]
+            top_right = first_grid[y0_idx, x1_idx]
+            bottom_left = first_grid[y1_idx, x0_idx]
+            bottom_right = first_grid[y1_idx, x1_idx]
+
+            # Perform bilinear interpolation
+            second_grid[i, j] = (
+                top_left * (1 - x_weight) * (1 - y_weight) +
+                top_right * x_weight * (1 - y_weight) +
+                bottom_left * (1 - x_weight) * y_weight +
+                bottom_right * x_weight * y_weight
+            )
 
     return second_grid
 
 
-@cuda.jit
-def gpu_trilinear_interpolate(first_grid, x0, x1, y0, y1, z0, z1, xw, yw, zw, second_grid):
-    i, j, k = cuda.grid(3)
+def trilinear_interpolate(np.ndarray[DTYPE_t, ndim=3] first_grid, int nx2, int ny2, int nz2):
+    """
+    Performs trilinear interpolation on a 3D grid to generate a finer or coarser second grid with specified dimensions.
 
-    if i < second_grid.shape[0] and j < second_grid.shape[1] and k < second_grid.shape[2]:
-        # Retrieve values at the eight corners
-        c000 = first_grid[z0[i], y0[j], x0[k]]
-        c001 = first_grid[z0[i], y0[j], x1[k]]
-        c010 = first_grid[z0[i], y1[j], x0[k]]
-        c011 = first_grid[z0[i], y1[j], x1[k]]
-        c100 = first_grid[z1[i], y0[j], x0[k]]
-        c101 = first_grid[z1[i], y0[j], x1[k]]
-        c110 = first_grid[z1[i], y1[j], x0[k]]
-        c111 = first_grid[z1[i], y1[j], x1[k]]
+    Parameters:
+    - first_grid (3D array_like): The 3D array representing the coarse grid.
+    - nx2, ny2, nz2 (int): The dimensions of the desired finer grid.
 
-        # Perform interpolation using weights
-        interpolated_value = (c000 * (1 - xw[k]) * (1 - yw[j]) * (1 - zw[i]) +
-                              c001 * xw[k] * (1 - yw[j]) * (1 - zw[i]) +
-                              c010 * (1 - xw[k]) * yw[j] * (1 - zw[i]) +
-                              c011 * xw[k] * yw[j] * (1 - zw[i]) +
-                              c100 * (1 - xw[k]) * (1 - yw[j]) * zw[i] +
-                              c101 * xw[k] * (1 - yw[j]) * zw[i] +
-                              c110 * (1 - xw[k]) * yw[j] * zw[i] +
-                              c111 * xw[k] * yw[j] * zw[i])
+    Returns:
+    - second_grid (3D array_like): The interpolated 3D array representing the second grid.
+    """
+    # Declare the original dimensions explicitly as integers
+    cdef int nx = first_grid.shape[2]
+    cdef int ny = first_grid.shape[1]
+    cdef int nz = first_grid.shape[0]
 
-        # Store the result in the output grid
-        second_grid[i, j, k] = interpolated_value
+    cdef int i, j, k
+    cdef int x0_idx, y0_idx, z0_idx, x1_idx, y1_idx, z1_idx
+    cdef double x_weight, y_weight, z_weight
+    cdef double c000, c001, c010, c011, c100, c101, c110, c111
 
-def trilinear_interpolate(first_grid, nx2, ny2, nz2):
-    nz, ny, nx = first_grid.shape
+    # Create empty finer grid
+    cdef np.ndarray[DTYPE_t, ndim=3] second_grid = np.zeros((nz2, ny2, nx2), dtype=np.float64)
 
-    # Generate the new grid coordinates
-    x_new = np.linspace(0, nx - 1, nx2)
-    y_new = np.linspace(0, ny - 1, ny2)
-    z_new = np.linspace(0, nz - 1, nz2)
+    # Calculate scaling factors
+    cdef double x_scale = (nx - 1) / (nx2 - 1)
+    cdef double y_scale = (ny - 1) / (ny2 - 1)
+    cdef double z_scale = (nz - 1) / (nz2 - 1)
 
-    # Calculate the floor of these coordinates to find the "low" indices
-    x0 = np.floor(x_new).astype(int)
-    y0 = np.floor(y_new).astype(int)
-    z0 = np.floor(z_new).astype(int)
+    # Perform trilinear interpolation
+    for i in range(nz2):
+        for j in range(ny2):
+            for k in range(nx2):
+                # Find the coordinates of the eight neighbors
+                x0_idx = int(np.floor(k * x_scale))
+                y0_idx = int(np.floor(j * y_scale))
+                z0_idx = int(np.floor(i * z_scale))
 
-    # Ensure "high" indices are within the grid bounds
-    x1 = np.clip(x0 + 1, 0, nx - 1)
-    y1 = np.clip(y0 + 1, 0, ny - 1)
-    z1 = np.clip(z0 + 1, 0, nz - 1)
+                x1_idx = min(x0_idx + 1, nx - 1)
+                y1_idx = min(y0_idx + 1, ny - 1)
+                z1_idx = min(z0_idx + 1, nz - 1)
 
-    # Calculate the interpolation weights
-    x_weight = (x_new - x0)
-    y_weight = (y_new - y0)
-    z_weight = (z_new - z0)
+                # Calculate interpolation weights
+                x_weight = (k * x_scale) - x0_idx
+                y_weight = (j * y_scale) - y0_idx
+                z_weight = (i * z_scale) - z0_idx
 
-    # If the grid size is large, use GPU; otherwise, use CPU
-    if nx2 * ny2 * nz2 > 2048:
-        # Allocate memory for result on GPU
-        second_grid_gpu = cuda.device_array((nz2, ny2, nx2), dtype=np.float64)
+                # Retrieve values at the corner points
+                c000 = first_grid[z0_idx, y0_idx, x0_idx]
+                c001 = first_grid[z0_idx, y0_idx, x1_idx]
+                c010 = first_grid[z0_idx, y1_idx, x0_idx]
+                c011 = first_grid[z0_idx, y1_idx, x1_idx]
+                c100 = first_grid[z1_idx, y0_idx, x0_idx]
+                c101 = first_grid[z1_idx, y0_idx, x1_idx]
+                c110 = first_grid[z1_idx, y1_idx, x0_idx]
+                c111 = first_grid[z1_idx, y1_idx, x1_idx]
 
-        # Launch kernel
-        threads_per_block = (8, 8, 8)
-        blocks_per_grid_x = (nx2 + threads_per_block[2] - 1) // threads_per_block[2]
-        blocks_per_grid_y = (ny2 + threads_per_block[1] - 1) // threads_per_block[1]
-        blocks_per_grid_z = (nz2 + threads_per_block[0] - 1) // threads_per_block[0]
-        blocks_per_grid = (blocks_per_grid_z, blocks_per_grid_y, blocks_per_grid_x)
-
-        gpu_trilinear_interpolate[blocks_per_grid, threads_per_block](
-            cuda.to_device(first_grid), cuda.to_device(x0), cuda.to_device(x1),
-            cuda.to_device(y0), cuda.to_device(y1), cuda.to_device(z0), cuda.to_device(z1),
-            cuda.to_device(x_weight), cuda.to_device(y_weight), cuda.to_device(z_weight), second_grid_gpu
-        )
-
-        # Copy result back to host
-        second_grid = second_grid_gpu.copy_to_host()
-    else:
-        # CPU-based trilinear interpolation
-        # Retrieve values at the eight corners for the entire grid
-        c000 = first_grid[z0[:, None, None], y0[None, :, None], x0[None, None, :]]
-        c001 = first_grid[z0[:, None, None], y0[None, :, None], x1[None, None, :]]
-        c010 = first_grid[z0[:, None, None], y1[None, :, None], x0[None, None, :]]
-        c011 = first_grid[z0[:, None, None], y1[None, :, None], x1[None, None, :]]
-        c100 = first_grid[z1[:, None, None], y0[None, :, None], x0[None, None, :]]
-        c101 = first_grid[z1[:, None, None], y0[None, :, None], x1[None, None, :]]
-        c110 = first_grid[z1[:, None, None], y1[None, :, None], x0[None, None, :]]
-        c111 = first_grid[z1[:, None, None], y1[None, :, None], x1[None, None, :]]
-
-        # Calculate weights
-        x_weight = x_weight.reshape(1, 1, -1)
-        y_weight = y_weight.reshape(1, -1, 1)
-        z_weight = z_weight.reshape(-1, 1, 1)
-
-        # Perform trilinear interpolation across the entire grid at once
-        second_grid = (c000 * (1 - x_weight) * (1 - y_weight) * (1 - z_weight) + 
-                       c001 * x_weight * (1 - y_weight) * (1 - z_weight) + 
-                       c010 * (1 - x_weight) * y_weight * (1 - z_weight) + 
-                       c011 * x_weight * y_weight * (1 - z_weight) + 
-                       c100 * (1 - x_weight) * (1 - y_weight) * z_weight + 
-                       c101 * x_weight * (1 - y_weight) * z_weight + 
-                       c110 * (1 - x_weight) * y_weight * z_weight + 
-                       c111 * x_weight * y_weight * z_weight)
+                # Perform trilinear interpolation
+                second_grid[i, j, k] = (
+                    c000 * (1 - x_weight) * (1 - y_weight) * (1 - z_weight) +
+                    c001 * x_weight * (1 - y_weight) * (1 - z_weight) +
+                    c010 * (1 - x_weight) * y_weight * (1 - z_weight) +
+                    c011 * x_weight * y_weight * (1 - z_weight) +
+                    c100 * (1 - x_weight) * (1 - y_weight) * z_weight +
+                    c101 * x_weight * (1 - y_weight) * z_weight +
+                    c110 * (1 - x_weight) * y_weight * z_weight +
+                    c111 * x_weight * y_weight * z_weight
+                )
 
     return second_grid
 
@@ -1030,50 +763,8 @@ class Preconditioner_GMG_Matrix():
     
         return v_coarse / np.linalg.norm(v_coarse)  # Normalize the correction vector before returning
 
-@cuda.jit
-def gpu_batch_update(x, r, alphas, previous_d, previous_dr, alpha):
-    i = cuda.grid(1)
-
-    if i < x.shape[0]:
-        # Use shared memory to accumulate results for x and r
-        acc_x = 0.0
-        acc_r = 0.0
-
-        for j in range(alphas.size):
-            acc_x += alphas[j] * previous_d[j, i] * alpha
-            acc_r += alphas[j] * previous_dr[j, i]
-
-        # Update x and r after the full accumulation
-        x[i] -= acc_x
-        r[i] -= acc_r
-
-
-def update_vectors_gpu(x, r, alphas, previous_d, previous_dr, alpha):
-    if(len(x)<2048):
-        for j in range(alphas.size):
-            x = x - alphas[j] * previous_d[j] * alpha
-            r = r - alphas[j] * previous_dr[j]
-    else:
-        # Ensure data is on the GPU
-        x_gpu = cuda.to_device(x)
-        r_gpu = cuda.to_device(r)
-        alphas_gpu = cuda.to_device(alphas)
-        previous_d_gpu = cuda.to_device(previous_d)
-        previous_dr_gpu = cuda.to_device(previous_dr)
-    
-        # Set up the thread and block configuration
-        threads_per_block = 256
-        blocks_per_grid = (x.size + (threads_per_block - 1)) // threads_per_block
-    
-        # Launch the kernel
-        gpu_batch_update[blocks_per_grid, threads_per_block](x_gpu, r_gpu, alphas_gpu, previous_d_gpu, previous_dr_gpu, alpha)
-    
-        # Copy the updated data back to the host
-        x = x_gpu.copy_to_host()
-        r = r_gpu.copy_to_host()
-
-    return x, r
-
+      
+     
 
 def solve(x_0,problem,solver_options,enable_preconditionner=True,off_set=np.zeros(0)):
     """
@@ -1144,7 +835,6 @@ def solve(x_0,problem,solver_options,enable_preconditionner=True,off_set=np.zero
     time_spent_on_alphas_matrix_assembly=0
     time_spent_on_alphas_matrix_solve=0
     time_spent_on_solution_update=0
-    time_spent_on_orthogonalization=0
     
     # Set the size of the pertubation vector with alpha and the tolerance
     alpha=solver_options.alpha
@@ -1180,13 +870,9 @@ def solve(x_0,problem,solver_options,enable_preconditionner=True,off_set=np.zero
             non_linear_index=0
         else:
             # Orthogonalized the correction vector with previous vectors
-            start_time_orth = time.time()
             for j in range(len(previous_d)):
-                proj = np.dot(d, previous_d[j])
-                d -= (proj / np.linalg.norm(previous_d[j])**2) * previous_d[j]
-            end_time_orth = time.time()
-            time_spent_on_orthogonalization+=end_time_orth-start_time_orth
-            
+                d=d-np.dot(d,previous_d[j])*previous_d[j]/np.linalg.norm(previous_d[j])**2
+                d=d/np.linalg.norm(d)
             # Add the new direction
             previous_d.append(d)
             # perturbed the Residual in the direction of d
@@ -1234,10 +920,9 @@ def solve(x_0,problem,solver_options,enable_preconditionner=True,off_set=np.zero
         
         start_time = time.time()
         # Update the solution (not vecotrized as it seems longer )
-        # for j in range(alphas.size):
-        #     x = x - alphas[j] * previous_d[j] * alpha
-        #     r = r - alphas[j] * previous_dr[j]
-        x,r=update_vectors_gpu(x, r, alphas, previous_d, previous_dr, alpha)
+        for j in range(alphas.size):
+            x = x - alphas[j] * previous_d[j] * alpha
+            r = r - alphas[j] * previous_dr[j]
     
         end_time = time.time()
         # Log the time spend on the update of the solution
@@ -1271,7 +956,6 @@ def solve(x_0,problem,solver_options,enable_preconditionner=True,off_set=np.zero
         print("time_spent_on_alphas_matrix_assembly= "+str(time_spent_on_alphas_matrix_assembly))
         print("time_spent_on_alphas_matrix_solve= "+str(time_spent_on_alphas_matrix_solve))
         print("time_spent_on_solution_update= "+str(time_spent_on_solution_update))
-        print("time_spent_on_orthogonalization= "+str(time_spent_on_orthogonalization))
         total_time_end=time.time()
         print("total time spent for n= " +str(len(x))+" dofs = "+str(total_time_end-total_time_start))
     return x,R_norm
@@ -1553,13 +1237,13 @@ n=100
 #problem=Problem(dim=3,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=0) # (Change gmg_gmres_tol to 1e-4 in solve_jac)
 
 # Problem 3
-problem=Problem(dim=3,nx=n,ny=n,nz=n,C=1,D=1,E=0,F=0,G=0) # Solvable with non linear GMG gmres solver not with jacobian non linear solver (Change gmg_gmres_tol to 1e-6 in solve_jac)
+#problem=Problem(dim=3,nx=n,ny=n,nz=n,C=1,D=1,E=0,F=0,G=0) # Solvable with non linear GMG gmres solver not with jacobian non linear solver (Change gmg_gmres_tol to 1e-6 in solve_jac)
 
 # Problem 4
 #problem=Problem(dim=2,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=10)  #Faster with non linear GMG gmres solver then jacobian non linear solver (Change gmg_gmres_tol to 5e-2 in solve_jac)
 
 # Problem 5
-#problem=Problem(dim=3,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=10) #Faster jacobian non linear solver then GMG gmres non linear solver. (Change gmg_gmres_tol to 5e-2 in solve_jac)
+problem=Problem(dim=3,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=10) #Faster jacobian non linear solver then GMG gmres non linear solver. (Change gmg_gmres_tol to 5e-2 in solve_jac)
 
 # Problem 6
 #problem=Problem(dim=2,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=100) # Solvable with non linear GMG gmres solver not with jacobian non linear solver (Change gmg_gmres_tol to 5e-2 in solve_jac)
@@ -1568,7 +1252,7 @@ problem=Problem(dim=3,nx=n,ny=n,nz=n,C=1,D=1,E=0,F=0,G=0) # Solvable with non li
 #problem=Problem(dim=3,nx=n,ny=n,nz=n,C=1,D=1,E=1,F=1,G=100) # Solvable with non linear GMG gmres solver and with jacobian non linear solver (barely) (Change gmg_gmres_tol to 5e-2 in solve_jac)
 
 # Setup the solver options see class definition for more details
-options=Preconditionner_option(level=2,alpha=0.0001,iterations_for_smoothing=5,frequency_of_residual_direct_evaluation=10,tol=1e-6,max_iterations=1000,max_krylov_vectors=1000,minimum_mesh_size=4,non_linearity_index_limit=0.5, verbosity=True)
+options=Preconditionner_option(level=2,alpha=0.0001,iterations_for_smoothing=5,frequency_of_residual_direct_evaluation=1,tol=1e-6,max_iterations=1000,max_krylov_vectors=1000,minimum_mesh_size=4,non_linearity_index_limit=0.5, verbosity=True)
 
 # Initialized x
 x=np.ones(problem.size)*0
